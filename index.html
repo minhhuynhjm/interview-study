@@ -7962,10 +7962,198 @@ res.cookie('session', sid, {
 <li><strong>Why:</strong> Người dùng thường dùng password yếu hoặc tái sử dụng password — kết hợp với tốc độ thử của máy tính (bcrypt hash tốt thì 1000/s, MD5 thì hàng tỷ/s) làm tấn công này hiệu quả. Credential stuffing đặc biệt nguy hiểm vì dùng password thật từ breach khác — bypass dictionary hoàn toàn. Lockout-based DoS cũng là rủi ro: attacker cố tình nhập sai để khóa account nạn nhân.</li>
 <li><strong>When:</strong> Endpoint cần bảo vệ là /login, /forgot-password, /reset-password, /2fa/verify, /api/key/generate. Bất kỳ endpoint nào cho phép thử nhiều lần với thông tin bí mật đều là mục tiêu. Phòng thủ cần kích hoạt từ request đầu tiên, không chờ đến khi phát hiện tấn công.</li>
 <li><strong>How:</strong> Kết hợp nhiều lớp: Rate limit theo IP + theo username (5 lần/phút/IP, 10 lần/giờ/account). CAPTCHA sau 3 lần sai. Account lockout tạm 15 phút + cảnh báo email. MFA/2FA bắt buộc. Hash password với bcrypt/argon2 cost cao. Slow-down response 1-2s khi sai. WAF (Cloudflare) detect bot pattern. Monitor spike login fail và alert. HaveIBeenPwned API kiểm tra password không nằm trong breach list.</li>
+<li><strong>Approaches / Implementation (defense-in-depth):</strong>
+  <ul>
+    <li><strong>Layer 1 — Rate limiting (network/edge):</strong> AspNetCoreRateLimit hoặc <code>Microsoft.AspNetCore.RateLimiting</code> (built-in từ .NET 7). Fixed window (5 req/15 min per IP), Sliding window (chính xác hơn), Token bucket (burst-friendly). Distributed counter qua Redis cho multi-instance.</li>
+    <li><strong>Layer 2 — Account lockout (application):</strong> ASP.NET Core Identity <code>MaxFailedAccessAttempts = 5</code>, <code>DefaultLockoutTimeSpan = 15 min</code>. Combine IP-based + account-based để tránh lockout DoS (attacker khóa victim).</li>
+    <li><strong>Layer 3 — Challenge (CAPTCHA):</strong> Google reCAPTCHA v3 (score 0.0-1.0, invisible) sau 3 lần fail; reCAPTCHA v2 checkbox cho legacy; hCaptcha (privacy-friendly alternative).</li>
+    <li><strong>Layer 4 — Strong password & breach check:</strong> Min 12 chars, complexity. HaveIBeenPwned API (k-anonymity: gửi 5 ký tự đầu của SHA-1 hash, không gửi password raw).</li>
+    <li><strong>Layer 5 — MFA/2FA:</strong> TOTP (Google Authenticator), SMS (yếu — SIM swap), Push (Authy/Microsoft Authenticator), WebAuthn/FIDO2 hardware key (mạnh nhất).</li>
+    <li><strong>Layer 6 — Slow hash:</strong> bcrypt cost 12 (~250ms/hash), Argon2id (resist GPU/ASIC), PBKDF2 (FIPS-compliant). Tự động chậm brute force offline khi DB leak.</li>
+    <li><strong>Layer 7 — WAF & anomaly detection:</strong> Cloudflare Bot Management, Azure WAF, AWS Shield. ML on login patterns (geo, device, time-of-day anomaly).</li>
+    <li><strong>Layer 8 — Honeypot & device fingerprint:</strong> Hidden field bot tự fill; FingerprintJS track device suspicious.</li>
+  </ul>
+</li>
+<li><strong>Production checklist:</strong>
+  <ul>
+    <li>Rate limit có ở /login, /forgot-password, /reset-password, /2fa/verify, /register, /api-key</li>
+    <li>Counter rate limit ở Redis (distributed), không in-memory khi multi-instance</li>
+    <li>Lockout combo IP + account, có whitelist cho corporate IP</li>
+    <li>Email alert khi account bị lock hoặc login từ device mới</li>
+    <li>Password hash: bcrypt cost ≥ 12 hoặc Argon2id, có migration plan tăng cost theo Moore's law</li>
+    <li>MFA bắt buộc cho admin/finance role; optional + recommended cho user thường</li>
+    <li>Generic error message: "Email hoặc mật khẩu sai" — không reveal user tồn tại hay không</li>
+    <li>Constant-time compare (always run bcrypt dummy hash khi user không tồn tại)</li>
+    <li>HaveIBeenPwned check khi register/change password</li>
+    <li>Logging: log failed attempts có IP/UA/timestamp nhưng KHÔNG log password</li>
+    <li>Monitor dashboard: spike of 401 → alert SOC team</li>
+    <li>WAF rule block known bot User-Agent và Tor exit nodes (nếu phù hợp business)</li>
+    <li>Session regenerate ID sau login thành công (chống session fixation)</li>
+    <li>Refresh token rotation + revocation list</li>
+  </ul>
+</li>
+<li><strong>Common pitfalls (senior-level):</strong>
+  <ul>
+    <li><strong>Lockout DoS:</strong> attacker cố tình nhập sai để khóa legitimate user → combo IP-based, CAPTCHA thay vì hard lockout, alert thay vì block</li>
+    <li><strong>Timing attack:</strong> response time khác nhau giữa "user không tồn tại" và "password sai" → reveal user enumeration. Fix: luôn chạy bcrypt với dummy hash</li>
+    <li><strong>Username enumeration via error message:</strong> "Email không tồn tại" vs "Sai password" — phải dùng generic message</li>
+    <li><strong>Forgot-password flow là bypass:</strong> attacker spam reset password → cũng phải rate limit endpoint này + CAPTCHA</li>
+    <li><strong>Session fixation:</strong> không regenerate session ID sau auth thành công → attacker tái sử dụng session cũ</li>
+    <li><strong>Log password trong cleartext:</strong> compliance violation (PCI-DSS, GDPR). Filter sensitive trong logging framework</li>
+    <li><strong>SMS 2FA bị SIM swap:</strong> ưu tiên TOTP/WebAuthn cho high-value account</li>
+    <li><strong>Rate limit chỉ dựa IP:</strong> botnet/proxy bypass dễ → phải combo với account + device fingerprint</li>
+    <li><strong>Memcached/in-memory rate counter:</strong> không sync giữa instances → attacker hit nhiều instance để né</li>
+    <li><strong>Password policy quá khắt khe phản tác dụng:</strong> user dùng password yếu hơn (Password123!) thay vì dài; NIST khuyên min 8 + check breach hơn là forced complexity</li>
+  </ul>
+</li>
 </ul>
 
 <h4><span class="tag-example">Ví dụ</span></h4>
-<pre>import rateLimit from 'express-rate-limit';
+<pre>// ============ C# / ASP.NET Core 8 — Production-grade login defense ============
+
+// 1. Program.cs — Identity với lockout + built-in Rate Limiting
+builder.Services.AddIdentity&lt;ApplicationUser, IdentityRole&gt;(opt =&gt; {
+    opt.Password.RequiredLength = 12;
+    opt.Password.RequireDigit = true;
+    opt.Password.RequireNonAlphanumeric = true;
+    // Lockout settings — chống brute force account-based
+    opt.Lockout.MaxFailedAccessAttempts = 5;
+    opt.Lockout.DefaultLockoutTimeSpan = TimeSpan.FromMinutes(15);
+    opt.Lockout.AllowedForNewUsers = true;
+})
+.AddEntityFrameworkStores&lt;AppDbContext&gt;()
+.AddDefaultTokenProviders();
+
+// Rate limiting (built-in .NET 7+) — IP-based sliding window
+builder.Services.AddRateLimiter(opt =&gt; {
+    opt.AddSlidingWindowLimiter("login", config =&gt; {
+        config.PermitLimit = 5;
+        config.Window = TimeSpan.FromMinutes(15);
+        config.SegmentsPerWindow = 3;
+        config.QueueLimit = 0;
+    });
+    opt.RejectionStatusCode = 429;
+});
+
+// 2. LoginController — bcrypt + constant-time + HaveIBeenPwned + reCAPTCHA
+[ApiController]
+[Route("api/auth")]
+public class AuthController : ControllerBase
+{
+    private readonly UserManager&lt;ApplicationUser&gt; _userManager;
+    private readonly SignInManager&lt;ApplicationUser&gt; _signInManager;
+    private readonly IRecaptchaService _recaptcha;
+    private readonly IPwnedService _pwned;
+    private readonly ILogger&lt;AuthController&gt; _log;
+    private const string DummyHash = "$2a$12$abcdefghijklmnopqrstuv.dummyhashforTiming";
+
+    [HttpPost("login")]
+    [EnableRateLimiting("login")]
+    public async Task&lt;IActionResult&gt; Login([FromBody] LoginDto dto)
+    {
+        // reCAPTCHA v3 — score &lt; 0.5 nghi vấn bot
+        if (!await _recaptcha.VerifyAsync(dto.RecaptchaToken, minScore: 0.5))
+            return BadRequest(new { error = "Vui lòng thử lại" });
+
+        var user = await _userManager.FindByEmailAsync(dto.Email);
+
+        // Constant-time: luôn chạy bcrypt dù user không tồn tại
+        var hash = user?.PasswordHash ?? DummyHash;
+        var valid = BCrypt.Net.BCrypt.Verify(dto.Password, hash);
+
+        if (user == null || !valid)
+        {
+            if (user != null)
+                await _userManager.AccessFailedAsync(user); // tự tăng counter + lockout
+            _log.LogWarning("Failed login {Email} from {IP}", dto.Email,
+                HttpContext.Connection.RemoteIpAddress);
+            await Task.Delay(Random.Shared.Next(800, 1200)); // slow-down + jitter
+            return Unauthorized(new { error = "Email hoặc mật khẩu sai" });
+        }
+
+        if (await _userManager.IsLockedOutAsync(user))
+            return StatusCode(423, new { error = "Account tạm khóa, thử lại sau 15 phút" });
+
+        await _userManager.ResetAccessFailedCountAsync(user);
+
+        // MFA enforced
+        if (await _userManager.GetTwoFactorEnabledAsync(user))
+            return Ok(new { requireMfa = true, mfaToken = GenerateMfaChallenge(user) });
+
+        // Regenerate session/token (chống session fixation)
+        var token = GenerateJwt(user);
+        return Ok(new { accessToken = token.Access, refreshToken = token.Refresh });
+    }
+
+    [HttpPost("register")]
+    public async Task&lt;IActionResult&gt; Register([FromBody] RegisterDto dto)
+    {
+        // Block password đã leak (HaveIBeenPwned k-anonymity API)
+        var pwnedCount = await _pwned.CheckPasswordAsync(dto.Password);
+        if (pwnedCount &gt; 0)
+            return BadRequest(new {
+                error = $"Password này đã xuất hiện {pwnedCount} lần trong breach. Hãy chọn password khác."
+            });
+
+        var user = new ApplicationUser { Email = dto.Email, UserName = dto.Email };
+        var result = await _userManager.CreateAsync(user, dto.Password);
+        return result.Succeeded ? Ok() : BadRequest(result.Errors);
+    }
+}
+
+// 3. HaveIBeenPwned service (k-anonymity — không gửi password raw)
+public class PwnedService : IPwnedService
+{
+    private readonly HttpClient _http;
+    public async Task&lt;int&gt; CheckPasswordAsync(string password)
+    {
+        using var sha1 = SHA1.Create();
+        var hash = Convert.ToHexString(sha1.ComputeHash(Encoding.UTF8.GetBytes(password)));
+        var prefix = hash[..5];
+        var suffix = hash[5..];
+
+        // API trả về list các suffix có prefix giống — không reveal full password
+        var resp = await _http.GetStringAsync($"https://api.pwnedpasswords.com/range/{prefix}");
+        foreach (var line in resp.Split('\n'))
+        {
+            var parts = line.Split(':');
+            if (parts[0].Equals(suffix, StringComparison.OrdinalIgnoreCase))
+                return int.Parse(parts[1].Trim());
+        }
+        return 0;
+    }
+}
+
+// 4. Distributed rate limit qua Redis (multi-instance) — custom middleware
+public class RedisRateLimitMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly IConnectionMultiplexer _redis;
+
+    public async Task InvokeAsync(HttpContext ctx)
+    {
+        if (!ctx.Request.Path.StartsWithSegments("/api/auth")) { await _next(ctx); return; }
+
+        var ip = ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        var key = $"rl:login:{ip}";
+        var db = _redis.GetDatabase();
+
+        var count = await db.StringIncrementAsync(key);
+        if (count == 1) await db.KeyExpireAsync(key, TimeSpan.FromMinutes(15));
+
+        if (count &gt; 5)
+        {
+            ctx.Response.StatusCode = 429;
+            ctx.Response.Headers["Retry-After"] = "900";
+            await ctx.Response.WriteAsJsonAsync(new { error = "Quá nhiều lần thử" });
+            return;
+        }
+        await _next(ctx);
+    }
+}
+
+// ============ Original Node.js example ============
+import rateLimit from 'express-rate-limit';
 import RedisStore from 'rate-limit-redis';
 import bcrypt from 'bcrypt';
 
@@ -14298,9 +14486,57 @@ var value = fast(user);</pre>
 <li><strong>Why:</strong> Tách cross-cutting concerns (logging, auth, CORS, error handling) ra khỏi business logic. Dễ thêm/bớt/sắp xếp lại behavior mà không sửa code ứng dụng.</li>
 <li><strong>When:</strong> Mọi HTTP concern nên là middleware: authentication, authorization, CORS, rate limiting, logging, exception handling, response caching. Thứ tự đăng ký CỰC KỲ quan trọng — sai thứ tự là bug.</li>
 <li><strong>How:</strong> Thứ tự chuẩn: <code>UseExceptionHandler</code> → <code>UseHttpsRedirection</code> → <code>UseStaticFiles</code> → <code>UseRouting</code> → <code>UseCors</code> → <code>UseAuthentication</code> → <code>UseAuthorization</code> → endpoints. Class middleware inject scoped service qua <code>InvokeAsync</code> parameter (không qua constructor vì middleware là singleton).</li>
+<li><strong>Pipeline architecture (Russian doll):</strong>
+<pre style="background:#f5f5f5;padding:8px;font-size:12px;">
+Request  →  [Exception]  →  [HTTPS]  →  [Static]  →  [Routing]  →  [CORS]  →  [AuthN]  →  [AuthZ]  →  [Custom]  →  Endpoint
+                                                                                                                       ↓
+Response ←  [Exception]  ←  [HTTPS]  ←  [Static]  ←  [Routing]  ←  [CORS]  ←  [AuthN]  ←  [AuthZ]  ←  [Custom]  ←  (handler chạy)
+
+* code TRƯỚC await next()  = chạy lúc REQUEST đi vào
+* code SAU  await next()   = chạy lúc RESPONSE đi ra
+* không gọi next()         = short-circuit (chặn không cho qua)
+</pre>
+</li>
+<li><strong>Approaches / 3 cách viết custom middleware:</strong>
+  <ul>
+    <li><strong>Cách 1 — Inline lambda với <code>app.Use()</code>:</strong> nhanh nhất, viết ngay trong Program.cs. Phù hợp logic ngắn, one-off, không reusable.</li>
+    <li><strong>Cách 2 — Convention-based class:</strong> static class với constructor nhận <code>RequestDelegate next</code> và method <code>InvokeAsync(HttpContext)</code>. Middleware là singleton; scoped service phải inject qua tham số <code>InvokeAsync</code>, KHÔNG qua constructor.</li>
+    <li><strong>Cách 3 — <code>IMiddleware</code> interface (factory-based):</strong> implement <code>IMiddleware.InvokeAsync(HttpContext, RequestDelegate)</code>, đăng ký <code>services.AddScoped&lt;MyMiddleware&gt;()</code>. Có DI lifetime đầy đủ (Scoped/Transient), test dễ hơn. Phải <code>app.UseMiddleware&lt;MyMiddleware&gt;()</code> bình thường.</li>
+    <li><strong>Branching pipeline:</strong> <code>app.Map("/admin", ...)</code> nhánh theo path, <code>app.MapWhen(predicate, ...)</code> nhánh theo điều kiện, <code>app.UseWhen(predicate, ...)</code> chạy middleware có điều kiện rồi join lại.</li>
+  </ul>
+</li>
+<li><strong>Production checklist:</strong>
+  <ul>
+    <li><code>UseExceptionHandler</code> đầu pipeline để bắt mọi exception phía sau</li>
+    <li><code>UseHsts()</code> ngay sau ExceptionHandler trong production</li>
+    <li><code>UseCors</code> PHẢI trước <code>UseAuthentication</code> và <code>UseAuthorization</code></li>
+    <li><code>UseAuthentication</code> luôn trước <code>UseAuthorization</code></li>
+    <li><code>UseRouting</code> trước <code>UseEndpoints</code>/<code>MapControllers</code>; CORS giữa Routing và Endpoints</li>
+    <li>Custom logging/correlation middleware đặt đầu (sau ExceptionHandler) để log mọi request</li>
+    <li>Health check endpoint short-circuit sớm — không qua auth pipeline</li>
+    <li>Response compression đặt trước static files</li>
+    <li>Có correlation ID propagate qua HttpContext.Items hoặc <code>Activity.Current</code></li>
+    <li>Test middleware riêng bằng <code>TestServer</code> + <code>WebApplicationFactory</code></li>
+    <li>Singleton middleware KHÔNG capture scoped DbContext trong field — inject qua InvokeAsync</li>
+  </ul>
+</li>
+<li><strong>Common pitfalls (senior-level):</strong>
+  <ul>
+    <li><strong>Sai thứ tự auth/cors:</strong> đặt <code>UseAuthorization</code> trước <code>UseAuthentication</code> → <code>HttpContext.User</code> luôn null. CORS sau auth → preflight OPTIONS bị reject 401.</li>
+    <li><strong>Quên <code>await next()</code>:</strong> response hang vô tận, request không bao giờ đến endpoint</li>
+    <li><strong>Write vào Response sau khi đã started:</strong> ném <code>InvalidOperationException</code>. Check <code>context.Response.HasStarted</code> trước khi modify headers</li>
+    <li><strong>Capture scoped service trong middleware singleton:</strong> dùng lại DbContext disposed → memory leak. Inject qua InvokeAsync parameter hoặc dùng <code>context.RequestServices.GetRequiredService&lt;T&gt;()</code></li>
+    <li><strong>Block thread đồng bộ (<code>.Result</code>, <code>.Wait()</code>):</strong> deadlock và thread pool starvation</li>
+    <li><strong>Modify response body (compression, logging):</strong> cần wrap response stream với MemoryStream/PipeWriter, swap back trước khi flush</li>
+    <li><strong>Đặt middleware sau <code>MapControllers</code>:</strong> không bao giờ chạy vì endpoint đã terminate pipeline</li>
+    <li><strong>Catch exception trong custom middleware nhưng nuốt:</strong> error handler global không thấy → dùng <code>throw;</code> hoặc rely on UseExceptionHandler</li>
+    <li><strong>Singleton config thay đổi runtime:</strong> dùng <code>IOptionsMonitor&lt;T&gt;</code> không phải <code>IOptions&lt;T&gt;</code> nếu cần hot-reload</li>
+    <li><strong>Performance:</strong> middleware chạy mọi request — tránh allocation lớn, log structured thay vì string interpolation</li>
+  </ul>
+</li>
 </ul>
 <h4><span class="tag-example">Ví dụ</span></h4>
-<pre>// 1. Custom middleware class
+<pre>// ============ 1. CONVENTION-BASED — RequestLoggingMiddleware ============
 public class RequestLoggingMiddleware
 {
     private readonly RequestDelegate _next;
@@ -14349,7 +14585,129 @@ app.Map("/admin", adminApp =&gt; {
 });
 
 app.MapControllers();
-app.Run();</pre>
+app.Run();
+
+// ============ 5. IMIDDLEWARE INTERFACE — CorrelationIdMiddleware ============
+// Lifetime Scoped, inject scoped service qua constructor (khác convention-based)
+public class CorrelationIdMiddleware : IMiddleware
+{
+    private const string HeaderName = "X-Correlation-ID";
+    private readonly ILogger&lt;CorrelationIdMiddleware&gt; _logger;
+
+    public CorrelationIdMiddleware(ILogger&lt;CorrelationIdMiddleware&gt; logger)
+        =&gt; _logger = logger;
+
+    public async Task InvokeAsync(HttpContext context, RequestDelegate next)
+    {
+        var correlationId = context.Request.Headers[HeaderName].FirstOrDefault()
+                            ?? Guid.NewGuid().ToString();
+
+        context.Items["CorrelationId"] = correlationId;
+        context.Response.Headers[HeaderName] = correlationId;
+
+        // Propagate vào logging scope — mọi log trong request có CorrelationId
+        using (_logger.BeginScope(new Dictionary&lt;string, object&gt; { ["CorrelationId"] = correlationId }))
+        {
+            await next(context);
+        }
+    }
+}
+// Đăng ký:
+//   builder.Services.AddScoped&lt;CorrelationIdMiddleware&gt;();
+//   app.UseMiddleware&lt;CorrelationIdMiddleware&gt;();
+
+// ============ 6. GLOBAL EXCEPTION HANDLER (RFC 7807 ProblemDetails) ============
+public class GlobalExceptionHandlerMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly ILogger&lt;GlobalExceptionHandlerMiddleware&gt; _logger;
+    private readonly IHostEnvironment _env;
+
+    public GlobalExceptionHandlerMiddleware(RequestDelegate next,
+        ILogger&lt;GlobalExceptionHandlerMiddleware&gt; logger, IHostEnvironment env)
+    {
+        _next = next; _logger = logger; _env = env;
+    }
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        try { await _next(context); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unhandled exception for {Path}", context.Request.Path);
+
+            if (context.Response.HasStarted)
+            {
+                _logger.LogWarning("Response already started — cannot write error");
+                throw;
+            }
+
+            var (status, title) = ex switch
+            {
+                ValidationException =&gt; (StatusCodes.Status400BadRequest, "Validation error"),
+                UnauthorizedAccessException =&gt; (StatusCodes.Status401Unauthorized, "Unauthorized"),
+                KeyNotFoundException =&gt; (StatusCodes.Status404NotFound, "Resource not found"),
+                _ =&gt; (StatusCodes.Status500InternalServerError, "Server error")
+            };
+
+            var problem = new ProblemDetails
+            {
+                Status = status,
+                Title = title,
+                Detail = _env.IsDevelopment() ? ex.ToString() : "An error occurred",
+                Instance = context.Request.Path,
+                Extensions = { ["correlationId"] = context.Items["CorrelationId"] }
+            };
+
+            context.Response.Clear();
+            context.Response.StatusCode = status;
+            context.Response.ContentType = "application/problem+json";
+            await context.Response.WriteAsJsonAsync(problem);
+        }
+    }
+}
+
+// ============ 7. CONDITIONAL & BRANCHING ============
+// UseWhen — chạy có điều kiện rồi join lại pipeline chính
+app.UseWhen(ctx =&gt; ctx.Request.Path.StartsWithSegments("/api"),
+    apiBranch =&gt; {
+        apiBranch.UseMiddleware&lt;RequestLoggingMiddleware&gt;();
+        apiBranch.UseMiddleware&lt;RateLimitingMiddleware&gt;();
+    });
+
+// MapWhen — nhánh hoàn toàn, không join lại
+app.MapWhen(ctx =&gt; ctx.Request.Query.ContainsKey("legacy"),
+    legacyBranch =&gt; legacyBranch.Run(async ctx =&gt;
+        await ctx.Response.WriteAsync("Legacy handler")));
+
+// ============ 8. EXTENSION METHOD WRAPPER (best practice) ============
+public static class MiddlewareExtensions
+{
+    public static IApplicationBuilder UseCorrelationId(this IApplicationBuilder app)
+        =&gt; app.UseMiddleware&lt;CorrelationIdMiddleware&gt;();
+
+    public static IApplicationBuilder UseGlobalExceptionHandler(this IApplicationBuilder app)
+        =&gt; app.UseMiddleware&lt;GlobalExceptionHandlerMiddleware&gt;();
+}
+// Sử dụng: app.UseGlobalExceptionHandler().UseCorrelationId();
+
+// ============ 9. PIPELINE THỨ TỰ CHUẨN CHO PRODUCTION ============
+/*
+app.UseGlobalExceptionHandler();    // 1. Bắt mọi exception
+app.UseHsts();                      // 2. Force HTTPS browser
+app.UseHttpsRedirection();          // 3. Redirect HTTP -&gt; HTTPS
+app.UseResponseCompression();       // 4. Gzip/Brotli
+app.UseStaticFiles();               // 5. wwwroot
+app.UseCorrelationId();             // 6. Correlation ID
+app.UseRequestLogging();            // 7. Log request
+app.UseRouting();                   // 8. Match route
+app.UseCors("AllowFrontend");       // 9. CORS (sau Routing, trước Auth)
+app.UseAuthentication();            // 10. Xác thực
+app.UseAuthorization();             // 11. Phân quyền
+app.UseRateLimiter();               // 12. Rate limit (sau auth để per-user)
+app.MapControllers();               // 13. Endpoint
+app.MapHealthChecks("/health");     // 14. Health check
+*/</pre>
 </div>
 </div>
 
@@ -14426,6 +14784,74 @@ new Foo().Bar(); // luôn in "instance" — không thể override</pre>
 <li><strong>Why:</strong> Same-origin policy bảo vệ user: script trên evil.com không đọc được data từ bank.com. CORS cho phép legitimate cross-origin calls (React frontend → backend API) trong khi ngăn unauthorized reads.</li>
 <li><strong>When:</strong> Cần khi frontend và backend ở khác domain/port (dev: localhost:3000 → localhost:5000, prod: app.example.com → api.example.com). Preflight <code>OPTIONS</code> tự động khi dùng non-simple method (PUT/DELETE) hoặc custom headers (Authorization, Content-Type: application/json).</li>
 <li><strong>How:</strong> ASP.NET Core: <code>AddCors()</code> khai báo named policy → <code>UseCors()</code> sau <code>UseRouting</code> trước <code>UseAuthorization</code>. KHÔNG kết hợp <code>AllowAnyOrigin()</code> với <code>AllowCredentials()</code> — browser từ chối; phải <code>WithOrigins("url")</code> khi cần cookie/auth header.</li>
+<li><strong>Simple vs Preflighted request:</strong>
+  <ul>
+    <li><strong>Simple request</strong> (KHÔNG preflight): method = GET/HEAD/POST + chỉ "CORS-safelisted headers" (Accept, Accept-Language, Content-Language, Content-Type với value <code>application/x-www-form-urlencoded</code>, <code>multipart/form-data</code>, <code>text/plain</code>).</li>
+    <li><strong>Preflighted request</strong> (browser auto OPTIONS trước): method khác (PUT/DELETE/PATCH), HOẶC có custom header (Authorization, X-*), HOẶC Content-Type là <code>application/json</code>.</li>
+  </ul>
+</li>
+<li><strong>Preflight flow chi tiết:</strong>
+<pre style="background:#f5f5f5;padding:8px;font-size:12px;">
+Browser  →  OPTIONS /api/orders
+            Origin: https://app.example.com
+            Access-Control-Request-Method: PUT
+            Access-Control-Request-Headers: authorization, content-type
+
+Server   ←  204 No Content
+            Access-Control-Allow-Origin: https://app.example.com
+            Access-Control-Allow-Methods: GET, POST, PUT, DELETE
+            Access-Control-Allow-Headers: Content-Type, Authorization
+            Access-Control-Allow-Credentials: true
+            Access-Control-Max-Age: 600        ← cache preflight 10 min
+
+Browser  →  PUT /api/orders   (actual request, kèm Authorization)
+            Origin: https://app.example.com
+
+Server   ←  200 OK
+            Access-Control-Allow-Origin: https://app.example.com
+            Access-Control-Allow-Credentials: true
+</pre>
+</li>
+<li><strong>Approaches / 3 cách cấu hình:</strong>
+  <ul>
+    <li><strong>Cách 1 — Named policy (recommended):</strong> <code>AddPolicy("Name", ...)</code> rồi áp dụng global qua <code>UseCors("Name")</code> hoặc per-endpoint qua <code>[EnableCors("Name")]</code>.</li>
+    <li><strong>Cách 2 — Default policy:</strong> <code>AddDefaultPolicy(...)</code>, áp dụng cho mọi endpoint khi gọi <code>UseCors()</code> không tham số. Phù hợp khi 1 frontend duy nhất.</li>
+    <li><strong>Cách 3 — Endpoint attribute:</strong> <code>[EnableCors("Policy")]</code> / <code>[DisableCors]</code> trên controller hoặc action cụ thể. Override policy global.</li>
+    <li><strong>Cách 4 — Dynamic origin:</strong> <code>SetIsOriginAllowed(origin =&gt; allowedList.Contains(origin))</code> khi cần validate động (subdomain wildcard, multi-tenant).</li>
+  </ul>
+</li>
+<li><strong>Production checklist:</strong>
+  <ul>
+    <li><code>UseCors</code> ĐẶT GIỮA <code>UseRouting</code> và <code>UseAuthentication/UseAuthorization</code></li>
+    <li>Origin list lấy từ <code>appsettings.json</code> hoặc env var, KHÔNG hardcode</li>
+    <li>Không dùng <code>AllowAnyOrigin()</code> trong production (chỉ dev/internal API)</li>
+    <li>Khi cần cookie/auth header: phải <code>WithOrigins(...)</code> + <code>AllowCredentials()</code></li>
+    <li>Whitelist headers tối thiểu cần thiết, không <code>AllowAnyHeader</code> nếu có thể</li>
+    <li><code>SetPreflightMaxAge(TimeSpan.FromMinutes(10))</code> cache preflight</li>
+    <li>Bật CORS cho SignalR hub: <code>WithOrigins</code> + <code>AllowCredentials</code> + <code>WithExposedHeaders</code></li>
+    <li>Test cross-origin từ DevTools: kiểm tra OPTIONS response 200/204, headers đúng</li>
+    <li>Reverse proxy (nginx/IIS) KHÔNG strip CORS headers</li>
+    <li>WebSocket dùng Origin header check riêng (CORS không áp dụng cho WS)</li>
+    <li>Document trong API spec danh sách origin được phép</li>
+  </ul>
+</li>
+<li><strong>Common pitfalls (senior-level):</strong>
+  <ul>
+    <li><strong>Sai thứ tự pipeline:</strong> <code>UseCors</code> sau <code>UseAuthentication</code> → preflight OPTIONS bị reject 401 vì OPTIONS không có Authorization header</li>
+    <li><strong><code>AllowAnyOrigin() + AllowCredentials()</code>:</strong> ném exception runtime — spec không cho. Phải <code>WithOrigins</code> cụ thể</li>
+    <li><strong>Wildcard <code>*</code> trong <code>Access-Control-Allow-Origin</code> kèm credentials:</strong> browser silent reject — DevTools console error duy nhất là CORS error</li>
+    <li><strong>Cache preflight quá lâu:</strong> sau khi đổi policy, browser còn dùng cache cũ → khó debug; <code>Max-Age</code> hợp lý 5-10 phút prod, 0 dev</li>
+    <li><strong>Trailing slash trong origin:</strong> <code>WithOrigins("https://app.com/")</code> KHÁC <code>"https://app.com"</code> — phải khớp exact</li>
+    <li><strong>Khác port = khác origin:</strong> <code>localhost:3000</code> và <code>localhost:3001</code> là 2 origin riêng</li>
+    <li><strong>HTTP vs HTTPS:</strong> scheme khác = origin khác</li>
+    <li><strong>Quên <code>WithExposedHeaders</code>:</strong> custom header (X-Total-Count, X-Pagination) frontend JS không đọc được dù response có</li>
+    <li><strong>fetch không gửi cookie:</strong> phải set <code>credentials: 'include'</code> bên client + <code>AllowCredentials()</code> bên server</li>
+    <li><strong>SignalR negotiate fail CORS:</strong> cần thêm <code>WithExposedHeaders("Connection-Id")</code> và explicit cho hub path</li>
+    <li><strong>Proxy/CDN strip OPTIONS:</strong> nginx/CloudFront bỏ headers — debug bằng curl <code>-X OPTIONS -v</code></li>
+    <li><strong>CORS ≠ security:</strong> CORS chỉ bảo vệ user browser; server-to-server không bị ràng buộc → vẫn cần auth/CSRF token</li>
+    <li><strong>Server trả 200 cho OPTIONS nhưng thiếu CORS headers:</strong> browser reject dù status OK — phải đủ 3 headers Allow-Origin/Methods/Headers</li>
+  </ul>
+</li>
 </ul>
 <h4><span class="tag-example">Ví dụ</span></h4>
 <pre>// Program.cs — cấu hình CORS với named policy
@@ -14472,6 +14898,97 @@ Preflight flow (browser tự động):
        Access-Control-Allow-Credentials: true
        Access-Control-Max-Age: 600
   4. Browser thấy OK -&gt; gửi PUT thật sự
+*/
+
+// ============ DYNAMIC ORIGIN — multi-tenant / subdomain wildcard ============
+var allowedOrigins = builder.Configuration
+    .GetSection("Cors:AllowedOrigins").Get&lt;string[]&gt;() ?? Array.Empty&lt;string&gt;();
+
+builder.Services.AddCors(options =&gt; {
+    options.AddPolicy("DynamicOrigin", policy =&gt; {
+        policy.SetIsOriginAllowed(origin =&gt; {
+                // 1. Whitelist exact match
+                if (allowedOrigins.Contains(origin)) return true;
+                // 2. Wildcard subdomain — *.example.com
+                if (Uri.TryCreate(origin, UriKind.Absolute, out var uri))
+                    return uri.Host.EndsWith(".example.com")
+                        &amp;&amp; uri.Scheme == "https";
+                return false;
+            })
+            .AllowAnyMethod()
+            .AllowAnyHeader()
+            .AllowCredentials()
+            .WithExposedHeaders("X-Total-Count", "X-Pagination");
+    });
+});
+
+// ============ PER-ENDPOINT ATTRIBUTE ============
+[ApiController]
+[Route("api/[controller]")]
+public class PublicController : ControllerBase
+{
+    [HttpGet("data")]
+    [EnableCors("AllowAll")]   // override global cho endpoint public
+    public IActionResult GetPublic() =&gt; Ok(new { data = "public" });
+
+    [HttpGet("internal")]
+    [DisableCors]              // disable CORS cho endpoint internal
+    public IActionResult GetInternal() =&gt; Ok();
+}
+
+// ============ APPSETTINGS.JSON ============
+/*
+{
+  "Cors": {
+    "AllowedOrigins": [
+      "https://app.example.com",
+      "https://admin.example.com",
+      "http://localhost:3000"
+    ]
+  }
+}
+*/
+
+// ============ FRONTEND fetch — phải set credentials cho cookie/auth ============
+/*
+// React/JS
+const res = await fetch('https://api.example.com/orders', {
+  method: 'PUT',
+  credentials: 'include',          // gửi cookie cross-origin
+  headers: {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${token}`,
+  },
+  body: JSON.stringify(order),
+});
+
+// Axios
+axios.defaults.withCredentials = true;
+*/
+
+// ============ CORS CHO SIGNALR HUB ============
+builder.Services.AddCors(o =&gt; o.AddPolicy("SignalRCors", p =&gt;
+    p.WithOrigins("https://app.example.com")
+     .AllowAnyHeader()
+     .AllowAnyMethod()
+     .AllowCredentials() // WebSocket negotiate cần
+));
+// app.MapHub&lt;ChatHub&gt;("/chat").RequireCors("SignalRCors");
+
+// ============ DEBUG bằng curl ============
+/*
+# Test preflight
+curl -i -X OPTIONS https://api.example.com/api/orders \
+  -H "Origin: https://app.example.com" \
+  -H "Access-Control-Request-Method: PUT" \
+  -H "Access-Control-Request-Headers: authorization, content-type"
+
+# Mong đợi:
+HTTP/1.1 204 No Content
+Access-Control-Allow-Origin: https://app.example.com
+Access-Control-Allow-Methods: GET,POST,PUT,DELETE
+Access-Control-Allow-Headers: Content-Type,Authorization
+Access-Control-Allow-Credentials: true
 */</pre>
 </div>
 </div>
@@ -15570,6 +16087,94 @@ function useQuoteCalc(input: QuoteInput) {
 <li><strong>Why:</strong> User không nên mất data khi đóng tab. Save mỗi keystroke gây API spam và rate limit. Conflict xảy ra khi nhiều tab/người cùng edit — nếu không detect, người sau overwrite người trước im lặng. PATCH chỉ dirty fields → giảm payload và giảm conflict window.</li>
 <li><strong>When:</strong> Auto save phù hợp cho: long-form (insurance quote, application form), collaborative editing, forms không có explicit "Save" button. Không dùng khi validation chưa pass (tránh lưu invalid data), không save trong unload nếu còn in-flight request.</li>
 <li><strong>How:</strong> <code>watch()</code> trigger effect → debounce 1-2s → kiểm tra <code>isDirty</code> → PATCH kèm <code>version</code> → nhận 409 Conflict → show diff dialog. Status flow: <code>idle → saving → saved/error</code>. Safety: <code>beforeunload</code> warn khi còn unsaved; persist vào <code>localStorage</code> để recover sau crash. Abort save request cũ nếu có save mới trigger trước khi xong.</li>
+<li><strong>Architecture flow:</strong>
+<pre style="background:#f5f5f5;padding:8px;font-size:12px;">
+User types  →  Form state (RHF watch)
+              ↓
+              debounce 1.5s
+              ↓
+Dirty check  →  diff vs lastSaved snapshot
+              ↓ if changed AND valid
+AbortController.abort(prev)  →  cancel in-flight save
+              ↓
+PATCH /api/quotes/:id  (body = dirty fields only, header = If-Match: version)
+              ↓
+       ┌──────┴───────┐
+   200 OK         409 Conflict        Network error
+   ↓              ↓                   ↓
+   update         show diff modal     retry queue + localStorage backup
+   version        (Keep mine /        + status="error"
+   status="saved" Take server /
+                  Merge)
+              ↓
+Status indicator UI (Saved • Saving • Failed • Unsaved)
+</pre>
+</li>
+<li><strong>Approaches / 5 trigger strategies:</strong>
+  <ul>
+    <li><strong>Cách 1 — Debounce on change (recommended):</strong> sau mỗi keystroke đợi 1-2s không gõ rồi save. <code>lodash.debounce</code> hoặc <code>useDebounce</code> custom hook. Cân bằng giữa responsive và API spam.</li>
+    <li><strong>Cách 2 — Throttle:</strong> max 1 save / N giây dù user gõ liên tục. Phù hợp khi cần update progress server-side (collaborative cursor).</li>
+    <li><strong>Cách 3 — Idle detection:</strong> save sau X giây user không tương tác (mousemove, keydown, scroll). Tốt cho long-form ít focus.</li>
+    <li><strong>Cách 4 — Lifecycle events:</strong> save on field blur, <code>visibilitychange</code> (tab inactive), <code>beforeunload</code> với <code>navigator.sendBeacon</code> (fire-and-forget khi đóng tab).</li>
+    <li><strong>Cách 5 — Background sync (offline-first):</strong> Service Worker queue request khi offline, retry khi reconnect; IndexedDB lưu draft. Workbox <code>BackgroundSyncPlugin</code>.</li>
+    <li><strong>Best practice combo:</strong> Cách 1 + Cách 4 (debounce khi gõ + flush on blur/unload) + Cách 5 (offline backup).</li>
+  </ul>
+</li>
+<li><strong>Conflict resolution strategies:</strong>
+  <ul>
+    <li><strong>Optimistic locking (version):</strong> client gửi <code>version</code>, server reject 409 nếu lệch → UI hiện diff modal cho user chọn</li>
+    <li><strong>Last-write-wins:</strong> đơn giản nhất, không an toàn nếu collaboration</li>
+    <li><strong>Operational Transform (OT):</strong> như Google Docs — transform operation thay vì replace state. Phức tạp, cần server-side support</li>
+    <li><strong>CRDT (Y.js, Automerge):</strong> merge tự động deterministic, no central authority</li>
+    <li><strong>Multi-tab sync:</strong> <code>BroadcastChannel</code> API broadcast state change giữa tabs cùng origin</li>
+  </ul>
+</li>
+<li><strong>Status indicator UX:</strong>
+  <ul>
+    <li><code>idle</code> — không hiển thị gì hoặc "All changes saved"</li>
+    <li><code>dirty</code> — "Unsaved changes" (chỉ hiện nếu debounce chưa fire)</li>
+    <li><code>saving</code> — spinner + "Saving..."</li>
+    <li><code>saved</code> — checkmark + "Saved {2 sec ago}" (auto-fade sau 3s hoặc cập nhật mỗi 30s)</li>
+    <li><code>error</code> — icon đỏ + "Failed, click to retry"</li>
+    <li><code>conflict</code> — modal với 3 options: Keep mine / Take server / Merge</li>
+    <li><code>offline</code> — "Saving locally, will sync when online"</li>
+  </ul>
+</li>
+<li><strong>Production checklist:</strong>
+  <ul>
+    <li>Debounce 1-2s (không quá ngắn = spam, không quá dài = mất data)</li>
+    <li>Chỉ save khi form thực sự dirty (compare với last saved snapshot)</li>
+    <li>Chỉ save khi validation pass (tránh lưu invalid)</li>
+    <li><code>AbortController</code> cancel request trước khi gửi request mới (tránh race)</li>
+    <li>PATCH chỉ dirty fields (không PUT toàn bộ object)</li>
+    <li>Optimistic locking qua <code>version</code> hoặc <code>If-Match: etag</code> header</li>
+    <li>409 Conflict response: hiện diff dialog, không silent overwrite</li>
+    <li><code>beforeunload</code> warn khi <code>isDirty</code> hoặc còn in-flight save</li>
+    <li><code>localStorage</code>/IndexedDB backup khi save fail (recovery sau crash)</li>
+    <li><code>BroadcastChannel</code> sync state giữa multiple tabs cùng user</li>
+    <li>Retry với exponential backoff cho network error (max 3 attempts)</li>
+    <li><code>navigator.sendBeacon</code> cho final save khi tab đóng (không block close)</li>
+    <li>Telemetry: log save success rate, conflict rate, retry count</li>
+    <li>Accessibility: aria-live region announce save status cho screen reader</li>
+    <li>Server-side: idempotency key chống duplicate save khi retry</li>
+  </ul>
+</li>
+<li><strong>Common pitfalls (senior-level):</strong>
+  <ul>
+    <li><strong>Race condition:</strong> save#1 chậm hơn save#2 → save#1 ghi đè save#2. Fix: <code>AbortController</code> cancel previous, hoặc check version response</li>
+    <li><strong>Infinite save loop:</strong> save callback set state, state change trigger save lại. Fix: chỉ trigger save khi <code>isDirty</code>, set <code>shouldDirty: false</code> khi sync server response về form</li>
+    <li><strong>Stale closure trong useEffect:</strong> deps array thiếu hoặc save callback capture old state. Fix: <code>useRef</code> cho mutable values hoặc thêm vào deps</li>
+    <li><strong>Lost data khi đóng tab:</strong> debounce chưa fire user đã đóng. Fix: <code>beforeunload</code> prompt + <code>navigator.sendBeacon</code> flush sync</li>
+    <li><strong>PII trong localStorage:</strong> credit card, SSN không nên cache local (XSS đọc được). Encrypt hoặc skip những field nhạy cảm</li>
+    <li><strong>Validation fail giữa chừng:</strong> user gõ invalid → có nên save? Best: save valid fields, đánh dấu field invalid riêng, không block save toàn form</li>
+    <li><strong>Server rate limit:</strong> debounce ngắn + nhiều user → spam API. Server-side rate limit + client debounce phải sync</li>
+    <li><strong>Conflict UX kém:</strong> hiện "Save failed" thay vì giải thích conflict → user mất data; phải hiện diff rõ ràng</li>
+    <li><strong>Multi-tab silent overwrite:</strong> tab A và B cùng edit, tab A save sau → tab B mất. Fix: <code>BroadcastChannel</code> + version check</li>
+    <li><strong>Memo deps wrong cho debounce function:</strong> <code>useMemo(() =&gt; debounce(...), [])</code> tạo function mới mỗi render → debounce reset</li>
+    <li><strong>Network flakiness silent ignore:</strong> save fail nhưng UI vẫn "Saved" → false confidence. Phải retry và show error</li>
+    <li><strong>Server response trễ làm form lock:</strong> đừng disable input khi đang saving — user gõ tiếp được, gộp với save tiếp theo</li>
+  </ul>
+</li>
 </ul>
 
 <h4><span class="tag-example">Ví dụ</span></h4>
@@ -15637,6 +16242,212 @@ function SaveStatus({ status, lastSavedAt }) {
   if (status === 'saved' &amp;&amp; lastSavedAt)
     return &lt;span&gt;Saved {formatRelative(lastSavedAt)}&lt;/span&gt;;
   return null;
+}
+
+// ============ useDebounce hook (custom) ============
+function useDebounce&lt;T&gt;(value: T, delay: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() =&gt; {
+    const t = setTimeout(() =&gt; setDebounced(value), delay);
+    return () =&gt; clearTimeout(t);
+  }, [value, delay]);
+  return debounced;
+}
+
+// ============ FULL useAutoSave với retry, localStorage backup, BroadcastChannel ============
+type SaveStatus = 'idle' | 'dirty' | 'saving' | 'saved' | 'error' | 'conflict' | 'offline';
+
+function useAutoSaveAdvanced(quoteId: string) {
+  const { watch, formState, getValues, reset } = useFormContext&lt;QuoteForm&gt;();
+  const [status, setStatus] = useState&lt;SaveStatus&gt;('idle');
+  const [lastSavedAt, setLastSavedAt] = useState&lt;Date | null&gt;(null);
+  const [conflict, setConflict] = useState&lt;{ server: QuoteForm; mine: QuoteForm } | null&gt;(null);
+
+  const versionRef = useRef&lt;number&gt;(0);
+  const abortRef = useRef&lt;AbortController | null&gt;(null);
+  const retryCountRef = useRef&lt;number&gt;(0);
+  const queryClient = useQueryClient();
+
+  const values = watch();
+  const debouncedValues = useDebounce(values, 1500);
+
+  // Sync giữa multi-tab
+  useEffect(() =&gt; {
+    const channel = new BroadcastChannel(`quote-${quoteId}`);
+    channel.onmessage = (e) =&gt; {
+      if (e.data.type === 'saved' &amp;&amp; e.data.version &gt; versionRef.current) {
+        versionRef.current = e.data.version;
+        // Re-fetch để tab này có data mới nhất
+        queryClient.invalidateQueries({ queryKey: ['quote', quoteId] });
+      }
+    };
+    return () =&gt; channel.close();
+  }, [quoteId, queryClient]);
+
+  // Save effect — chỉ fire khi debouncedValues thực sự đổi
+  useEffect(() =&gt; {
+    if (!formState.isDirty) return;
+    if (!formState.isValid) { setStatus('dirty'); return; }
+    if (!navigator.onLine) {
+      // Backup localStorage, đợi reconnect
+      localStorage.setItem(`draft-${quoteId}`, JSON.stringify({
+        data: getValues(),
+        version: versionRef.current,
+        savedAt: Date.now(),
+      }));
+      setStatus('offline');
+      return;
+    }
+
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setStatus('saving');
+
+    const dirtyData = pickDirty(getValues(), formState.dirtyFields);
+
+    saveQuote(quoteId, {
+      data: dirtyData,
+      version: versionRef.current,
+      signal: controller.signal,
+    })
+      .then((res) =&gt; {
+        versionRef.current = res.version;
+        retryCountRef.current = 0;
+        setStatus('saved');
+        setLastSavedAt(new Date());
+        localStorage.removeItem(`draft-${quoteId}`); // dọn backup
+
+        // Reset dirty flag — KHÔNG dirty nữa sau khi save thành công
+        reset(res.data, { keepValues: true, keepDirty: false });
+
+        // Notify multi-tab
+        new BroadcastChannel(`quote-${quoteId}`).postMessage({
+          type: 'saved', version: res.version,
+        });
+      })
+      .catch((err) =&gt; {
+        if (err.name === 'AbortError') return;
+        if (err.status === 409) {
+          setConflict({ server: err.serverData, mine: getValues() });
+          setStatus('conflict');
+          return;
+        }
+        // Retry với exponential backoff
+        if (retryCountRef.current &lt; 3) {
+          retryCountRef.current++;
+          setTimeout(() =&gt; setStatus('dirty'),
+            Math.pow(2, retryCountRef.current) * 1000);
+        } else {
+          // Lưu local backup khi fail cuối
+          localStorage.setItem(`draft-${quoteId}`, JSON.stringify({
+            data: getValues(),
+            version: versionRef.current,
+            error: err.message,
+          }));
+          setStatus('error');
+        }
+      });
+
+    return () =&gt; controller.abort();
+  }, [debouncedValues]); // eslint-disable-line
+
+  // Flush save khi tab inactive hoặc đóng
+  useEffect(() =&gt; {
+    const flush = () =&gt; {
+      if (!formState.isDirty) return;
+      // sendBeacon = fire-and-forget, không block close
+      const payload = JSON.stringify({
+        data: pickDirty(getValues(), formState.dirtyFields),
+        version: versionRef.current,
+      });
+      navigator.sendBeacon(`/api/quotes/${quoteId}/flush`,
+        new Blob([payload], { type: 'application/json' }));
+    };
+
+    const onVisChange = () =&gt; { if (document.hidden) flush(); };
+    const onUnload = (e: BeforeUnloadEvent) =&gt; {
+      if (formState.isDirty || status === 'saving') {
+        e.preventDefault();
+        e.returnValue = ''; // browser hiển thị warning chuẩn
+        flush();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisChange);
+    window.addEventListener('beforeunload', onUnload);
+    return () =&gt; {
+      document.removeEventListener('visibilitychange', onVisChange);
+      window.removeEventListener('beforeunload', onUnload);
+    };
+  }, [formState.isDirty, status, quoteId, getValues]);
+
+  // Online/offline detection
+  useEffect(() =&gt; {
+    const onOnline = () =&gt; {
+      const draft = localStorage.getItem(`draft-${quoteId}`);
+      if (draft &amp;&amp; status === 'offline') setStatus('dirty'); // trigger save
+    };
+    window.addEventListener('online', onOnline);
+    return () =&gt; window.removeEventListener('online', onOnline);
+  }, [quoteId, status]);
+
+  return { status, lastSavedAt, conflict, resolveConflict: setConflict };
+}
+
+// ============ CONFLICT RESOLUTION DIALOG ============
+function ConflictModal({
+  conflict, onResolve,
+}: {
+  conflict: { server: QuoteForm; mine: QuoteForm };
+  onResolve: (resolution: 'mine' | 'server' | 'merge', merged?: QuoteForm) =&gt; void;
+}) {
+  const diffs = diffFields(conflict.mine, conflict.server);
+  return (
+    &lt;Modal&gt;
+      &lt;h3&gt;Conflict — data đã thay đổi ở nơi khác&lt;/h3&gt;
+      &lt;DiffView mine={conflict.mine} server={conflict.server} fields={diffs} /&gt;
+      &lt;button onClick={() =&gt; onResolve('mine')}&gt;Giữ thay đổi của tôi&lt;/button&gt;
+      &lt;button onClick={() =&gt; onResolve('server')}&gt;Lấy bản server&lt;/button&gt;
+      &lt;button onClick={() =&gt; onResolve('merge', mergeFields(conflict))}&gt;Merge tự động&lt;/button&gt;
+    &lt;/Modal&gt;
+  );
+}
+
+// ============ FULL STATUS INDICATOR với aria-live ============
+function SaveStatusIndicator({ status, lastSavedAt }: { status: SaveStatus; lastSavedAt: Date | null }) {
+  const [, force] = useState(0);
+  // Re-render mỗi 30s để cập nhật "Saved 2 min ago"
+  useEffect(() =&gt; {
+    const id = setInterval(() =&gt; force(n =&gt; n + 1), 30_000);
+    return () =&gt; clearInterval(id);
+  }, []);
+
+  const label = (() =&gt; {
+    switch (status) {
+      case 'saving':   return '⟳ Saving…';
+      case 'saved':    return lastSavedAt ? `✓ Saved ${formatRelative(lastSavedAt)}` : '✓ Saved';
+      case 'error':    return '✗ Save failed — click to retry';
+      case 'conflict': return '⚠ Conflict — resolve';
+      case 'offline':  return '⊘ Offline — saved locally';
+      case 'dirty':    return '● Unsaved changes';
+      default:         return null;
+    }
+  })();
+
+  return (
+    &lt;div role="status" aria-live="polite" className={`save-status save-${status}`}&gt;
+      {label}
+    &lt;/div&gt;
+  );
+}
+
+// ============ pickDirty utility ============
+function pickDirty&lt;T extends object&gt;(values: T, dirtyFields: any): Partial&lt;T&gt; {
+  const result: any = {};
+  for (const key of Object.keys(dirtyFields)) {
+    if (dirtyFields[key]) result[key] = (values as any)[key];
+  }
+  return result;
 }</pre>
 </div>
 </div>
